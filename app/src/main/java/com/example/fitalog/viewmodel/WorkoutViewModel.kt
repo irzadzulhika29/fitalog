@@ -1,0 +1,227 @@
+package com.example.fitalog.viewmodel
+
+import android.net.Uri
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.example.fitalog.data.WorkoutRepository
+import com.example.fitalog.model.DailyProgress
+import com.example.fitalog.model.DailyStats
+import com.example.fitalog.model.Workout
+import com.example.fitalog.model.WorkoutData
+import com.example.fitalog.model.WorkoutLog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
+
+class WorkoutViewModel(private val repository: WorkoutRepository) : ViewModel() {
+
+    val workouts: List<Workout> = WorkoutData.workouts
+
+    private val _logs = MutableStateFlow(repository.loadLogs())
+    val logs: StateFlow<List<WorkoutLog>> = _logs.asStateFlow()
+
+    private val _isRefreshing = MutableStateFlow(false)
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
+    val todayStats: StateFlow<DailyStats> = _logs
+        .map { repository.calculateTodayStats(it) }
+        .stateIn(
+            scope = viewModelScope,
+            started = kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000),
+            initialValue = repository.calculateTodayStats(_logs.value)
+        )
+
+    val weeklyProgress: StateFlow<List<DailyProgress>> = _logs
+        .map { repository.getRecentProgress(it) }
+        .stateIn(
+            scope = viewModelScope,
+            started = kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000),
+            initialValue = repository.getRecentProgress(_logs.value)
+        )
+
+    private val _timerState = MutableStateFlow(TimerState())
+    val timerState: StateFlow<TimerState> = _timerState.asStateFlow()
+
+    private var timerJob: Job? = null
+
+    fun startSession(workoutId: Int) {
+        val selectedWorkout = workouts.find { it.id == workoutId }
+        _timerState.value = TimerState(selectedWorkout = selectedWorkout)
+        timerJob?.cancel()
+    }
+
+    fun cancelSession() {
+        timerJob?.cancel()
+        _timerState.value = TimerState()
+    }
+
+    fun startTimer() {
+        if (_timerState.value.selectedWorkout == null || _timerState.value.isRunning) return
+        _timerState.value = _timerState.value.copy(isRunning = true, isPaused = false)
+        startTicker()
+    }
+
+    fun pauseTimer() {
+        timerJob?.cancel()
+        _timerState.value = _timerState.value.copy(isRunning = false, isPaused = true)
+    }
+
+    fun resumeTimer() {
+        if (_timerState.value.selectedWorkout == null || _timerState.value.isRunning) return
+        _timerState.value = _timerState.value.copy(isRunning = true, isPaused = false)
+        startTicker()
+    }
+
+    suspend fun finishWorkout(imageUri: String? = null): WorkoutLog? {
+        val workout = _timerState.value.selectedWorkout ?: return null
+        val elapsedSeconds = _timerState.value.elapsedSeconds
+        if (elapsedSeconds <= 0) {
+            resetTimer()
+            return null
+        }
+
+        val durationMinutes = elapsedSeconds / 60.0
+        val calories = calculateCalories(workout.met, durationMinutes)
+        val currentTime = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
+        val uploadedImageUri = imageUri?.let { uploadWorkoutImage(it) }
+        val log = WorkoutLog(
+            date = LocalDate.now().toString(),
+            time = currentTime,
+            workout = workout.name,
+            durationMinutes = durationMinutes,
+            calories = calories,
+            timestamp = System.currentTimeMillis(),
+            imageUri = uploadedImageUri ?: imageUri
+        )
+        val updatedLogs = withContext(Dispatchers.IO) { repository.addLog(log) }
+        _logs.value = updatedLogs
+        uploadLogToSupabase(log)
+        resetTimer()
+        return log
+    }
+
+    fun deleteLog(log: WorkoutLog) {
+        val updatedLogs = repository.deleteLog(log)
+        _logs.value = updatedLogs
+        deleteLogFromSupabase(log)
+    }
+
+    private suspend fun uploadWorkoutImage(imageUri: String): String? {
+        val uri = runCatching { Uri.parse(imageUri) }.getOrNull() ?: return null
+        val result = try {
+            repository.uploadWorkoutImage(uri)
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+
+        result.onFailure { error ->
+            println("Failed to upload image to Supabase: ${error.message}")
+        }
+
+        return result.getOrNull()
+    }
+
+    fun clearLogs() {
+        val updatedLogs = repository.clearLogs()
+        _logs.value = updatedLogs
+    }
+
+    fun refreshLogs() {
+        viewModelScope.launch {
+            _isRefreshing.value = true
+            val result = try {
+                repository.fetchLogsFromApi()
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+
+            result.onSuccess { remoteLogs ->
+                repository.saveLogs(remoteLogs)
+                _logs.value = remoteLogs
+            }.onFailure { error ->
+                println("Failed to refresh logs from Supabase: ${error.message}")
+            }
+            _isRefreshing.value = false
+        }
+    }
+
+    fun getWorkoutById(id: Int): Workout? = workouts.find { it.id == id }
+
+    private fun calculateCalories(met: Double, durationMinutes: Double): Double {
+        val defaultWeightKg = 70.0
+        return met * 3.5 * defaultWeightKg / 200.0 * durationMinutes
+    }
+
+    private fun startTicker() {
+        timerJob?.cancel()
+        timerJob = viewModelScope.launch {
+            while (true) {
+                delay(1_000)
+                _timerState.value = _timerState.value.copy(
+                    elapsedSeconds = _timerState.value.elapsedSeconds + 1
+                )
+            }
+        }
+    }
+
+    private fun resetTimer() {
+        timerJob?.cancel()
+        _timerState.value = TimerState()
+    }
+
+    private fun uploadLogToSupabase(log: WorkoutLog) {
+        viewModelScope.launch {
+            val result = try {
+                repository.uploadLogToApi(log)
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+
+            result.onFailure { error ->
+                println("Failed to upload log to Supabase: ${error.message}")
+            }
+        }
+    }
+
+    private fun deleteLogFromSupabase(log: WorkoutLog) {
+        viewModelScope.launch {
+            val result = try {
+                repository.deleteLogFromApi(log.timestamp)
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+
+            result.onFailure { error ->
+                println("Failed to delete log from Supabase: ${error.message}")
+            }
+        }
+    }
+
+    data class TimerState(
+        val selectedWorkout: Workout? = null,
+        val elapsedSeconds: Int = 0,
+        val isRunning: Boolean = false,
+        val isPaused: Boolean = false
+    )
+
+    companion object {
+        fun provideFactory(repository: WorkoutRepository): ViewModelProvider.Factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                    return WorkoutViewModel(repository) as T
+                }
+            }
+    }
+}
